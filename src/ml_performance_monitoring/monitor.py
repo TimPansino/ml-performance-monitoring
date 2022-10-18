@@ -2,6 +2,7 @@ import atexit
 import datetime
 import logging
 import os
+import time
 import uuid
 import warnings
 from enum import Enum, EnumMeta
@@ -18,6 +19,13 @@ from newrelic_telemetry_sdk import (
     MetricClient,
 )
 from newrelic_telemetry_sdk.event import Event
+
+# Import current_transaction from newrelic.agent if installed, or always return None
+try:
+    from newrelic.agent import current_transaction
+except ImportError:
+    current_transaction = lambda *args, **kwargs: None  # Always return None if no agent is installed
+
 
 logger = logging.getLogger("ml_performance_monitoring")
 
@@ -178,6 +186,7 @@ class MLPerformanceMonitoring:
     def _record_events(self, events, table: str):
         for event in events:
             event["eventType"] = table
+            event.update(self.distributed_trace_attributes())
             self.event_batch.record(event)
 
     def _record_metrics(self, metrics):
@@ -395,6 +404,7 @@ class MLPerformanceMonitoring:
                 "metricType": metric_type,
             }
         )
+        metadata.update(self.distributed_trace_attributes())
         if feature_name is not None:
             metadata.update({"feature_name": feature_name})
         if self.model_version is not None:
@@ -444,6 +454,43 @@ class MLPerformanceMonitoring:
         y_pred = self.model.fit_predict(X, y)
         self.record_inference_data(X, y_pred, **kwargs)
         return y_pred
+
+    @staticmethod
+    def distributed_trace_attributes():
+        attributes = {}
+
+        transaction = current_transaction()
+        if transaction:
+            data = transaction._create_distributed_trace_data()
+            if data:
+                # Taken from transaction.accept_distrubuted_trace_data
+
+                # guid not implemented
+                attributes["parent.transportType"] = "Other"
+                attributes["parent.type"] = data.get("ty")
+                attributes["parentSpanId"] = data.get("id")
+                attributes["parentId"] = data.get("tx")
+                attributes["parent.app"] = data.get("ap")
+                attributes["parent.account"] = data.get("ac")
+
+                attributes["traceId"] = data.get("tr")
+
+                priority = data.get("pr")
+                if priority is not None:
+                    attributes["priority"] = priority
+                    attributes["sampled"] = data.get("sa")
+
+                if "ti" in data:
+                    transport_start = data["ti"] / 1000.0
+
+                    # If starting in the future, transport duration should be set to 0
+                    now = time.time()
+                    if transport_start > now:
+                        attributes["parent.transportDuration"] = 0.0
+                    else:
+                        attributes["parent.transportDuration"] = now - transport_start
+
+        return attributes
 
 
 def wrap_model(
