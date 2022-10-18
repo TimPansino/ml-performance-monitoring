@@ -17,14 +17,45 @@ from newrelic_telemetry_sdk import (
     Harvester,
     MetricBatch,
     MetricClient,
+    Span,
+    SpanClient,
+    SpanBatch,
 )
 from newrelic_telemetry_sdk.event import Event
 
-# Import current_transaction from newrelic.agent if installed, or always return None
+# Import and use the agent to create distributed tracing spans if it exists, otherwise add a passthrough decorator.
 try:
     from newrelic.agent import current_transaction
+    from newrelic.object_wrappers import function_wrapper
+
+    @function_wrapper
+    def distributed_tracing_span(wrapped, instance, args, kwargs):
+        """Wrapper to add DT spans surrounding a function call."""
+        transaction = current_transaction()
+        if not transaction:
+            return wrapped(*args, **kwargs)
+        
+        dt_data = transaction._create_distributed_trace_data()
+        span_args = {}
+        if dt_data:
+            span_args = {
+                "trace_id": dt_data.get("tr"),
+                "parent_id": dt_data.get("id"),
+            }
+
+        with Span(**span_args) as span:
+            result = wrapped(*args, **kwargs)
+        
+        try:
+            instance._record_span(span)
+        except Exception as e:
+            instance._log(str(e))
+        
+        return result
+
 except ImportError:
     current_transaction = lambda *args, **kwargs: None  # Always return None if no agent is installed
+    distributed_tracing_span = lambda f: f  # Passthrough decorator that does nothing
 
 
 logger = logging.getLogger("ml_performance_monitoring")
@@ -76,6 +107,7 @@ class MLPerformanceMonitoring:
         label_type: Optional[str] = None,
         event_client_host: Optional[str] = None,
         metric_client_host: Optional[str] = None,
+        span_client_host: Optional[str] = None,
         use_logger: Optional[bool] = None,
     ):
 
@@ -95,6 +127,8 @@ class MLPerformanceMonitoring:
             raise TypeError("event_client_host instance type must be str or None")
         if not isinstance(metric_client_host, str) and metric_client_host is not None:
             raise TypeError("metric_client_host instance type must be str or None")
+        if not isinstance(span_client_host, str) and span_client_host is not None:
+            raise TypeError("span_client_host instance type must be str or None")
         if label_type not in LabelType:
             raise TypeError(
                 f"label_type instance must be one of the values: {[e.value for e in LabelType]}"
@@ -106,6 +140,10 @@ class MLPerformanceMonitoring:
 
         self.metric_client_host = metric_client_host or os.getenv(
             "METRIC_CLIENT_HOST", MetricClient.HOST
+        )
+
+        self.span_client_host = span_client_host or os.getenv(
+            "SPAN_CLIENT_HOST", SpanClient.HOST
         )
 
         self._set_insert_key(insert_key)
@@ -173,6 +211,15 @@ class MLPerformanceMonitoring:
         # Background thread that flushes the batch
         self.event_harvester = Harvester(self.event_client, self.event_batch)
 
+        self.span_client = SpanClient(
+            self.insert_key,
+            host=self.span_client_host,
+        )
+        self.span_batch = SpanBatch()
+
+        # Background thread that flushes the batch
+        self.span_harvester = Harvester(self.span_client, self.span_batch)
+
         # This starts the thread
         self.metric_harvester.start()
         self.event_harvester.start()
@@ -192,6 +239,9 @@ class MLPerformanceMonitoring:
     def _record_metrics(self, metrics):
         for metric in metrics:
             self.metric_batch.record_gauge(metric["name"], metric.value, metric.tags)
+
+    def _record_span(self, span):
+        self.span_batch.record(span)
 
     def set_model(self, model):
         self.model = model
@@ -423,18 +473,21 @@ class MLPerformanceMonitoring:
         if successfully_message:
             self._log(f"{metric_type} sent successfully")
 
+    @distributed_tracing_span
     def predict(self, X: Union[pd.DataFrame, np.ndarray], **kwargs):
         """This method call the model 'predict' method and also call 'record_inference_data' method to send  inference data to the table "InferenceData" in New Relic NRDB"""
         y_pred = self.model.predict(X)
         self.record_inference_data(X, y_pred, **kwargs)
         return y_pred
 
+    @distributed_tracing_span
     def predict_log_proba(self, X: Union[pd.DataFrame, np.ndarray], **kwargs):
         """This method call the model 'predict_log_proba' method and also call 'record_inference_data' method to send  inference data to the table "InferenceData" in New Relic NRDB"""
         y_pred = self.model.predict_log_proba(X)
         self.record_inference_data(X, y_pred, **kwargs)
         return y_pred
 
+    @distributed_tracing_span
     def predict_proba(self, X: Union[pd.DataFrame, np.ndarray], **kwargs):
         """This method call the model 'predict_log_proba' method and also call 'record_inference_data' method to send metrics to the table "InferenceData" in New Relic NRDB"""
         y_pred = self.model.predict_proba(X)
@@ -449,6 +502,7 @@ class MLPerformanceMonitoring:
         """This method call the model 'fit_transform' method"""
         return self.model.fit_transform(X, y)
 
+    @distributed_tracing_span
     def fit_predict(self, X: Union[pd.DataFrame, np.ndarray], y, **kwargs):
         """This method call the model 'fit_predict' method and also call 'record_inference_data' method to send inference data to the table "InferenceData" in New Relic NRDB"""
         y_pred = self.model.fit_predict(X, y)
@@ -507,6 +561,7 @@ def wrap_model(
     label_type: Optional[str] = None,
     event_client_host: Optional[str] = None,
     metric_client_host: Optional[str] = None,
+    span_client_host: Optional[str] = None,
 ) -> MLPerformanceMonitoring:
     """This is a wrapper function that extends the model/pipeline methods with the functionality of sending the inference data to the table "InferenceData" in New Relic NRDB"""
     return MLPerformanceMonitoring(
@@ -523,4 +578,5 @@ def wrap_model(
         label_type,
         event_client_host,
         metric_client_host,
+        span_client_host,
     )
